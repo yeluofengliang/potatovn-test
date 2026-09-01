@@ -1,0 +1,84 @@
+name: Build Plugin
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 查看仓库结构
+        shell: pwsh
+        run: |
+          Write-Host "=== 仓库根目录 ==="
+          Get-ChildItem -Force | ForEach-Object { Write-Host "  $($_.Name)" }
+          Write-Host ""
+          Write-Host "=== 所有 .csproj 文件 ==="
+          Get-ChildItem -Recurse -Filter *.csproj | ForEach-Object {
+            Write-Host "  $($_.FullName.Replace($env:GITHUB_WORKSPACE, ''))"
+          }
+
+      - name: 定位插件项目
+        id: locate
+        shell: pwsh
+        run: |
+          $proj = Get-ChildItem -Recurse -Filter "PotatoVN.App.Plugin.ScrapeControl.csproj" |
+                  Select-Object -First 1
+          if (-not $proj) {
+            Write-Error "未找到 csproj，请确认源码已完整上传"
+            exit 1
+          }
+          $rel = $proj.FullName.Replace("$env:GITHUB_WORKSPACE\", "")
+          Write-Host "找到插件项目：$rel"
+          "project_file=$rel" >> $env:GITHUB_OUTPUT
+
+      - name: 拉取 PotatoVN 宿主源码
+        shell: pwsh
+        run: |
+          $projFile = "${{ steps.locate.outputs.project_file }}"
+          $projDir  = Split-Path $projFile -Parent
+          $parent   = Split-Path $projDir -Parent
+          if ([string]::IsNullOrWhiteSpace($parent)) { $parent = "." }
+
+          $hostDir = Join-Path $parent "PotatoVN"
+          $marker  = Join-Path $hostDir "GalgameManager.WinApp.Base\GalgameManager.WinApp.Base.csproj"
+
+          if (Test-Path $marker) {
+            Write-Host "宿主源码已存在，跳过下载"
+          } else {
+            Write-Host "克隆宿主源码到 $hostDir ..."
+            git clone --depth 1 -b dev https://github.com/GoldenPotato137/PotatoVN.git $hostDir
+            if ($LASTEXITCODE -ne 0) { Write-Error "克隆失败"; exit 1 }
+          }
+
+          if (-not (Test-Path $marker)) {
+            Write-Error "宿主源码结构异常"
+            exit 1
+          }
+          Write-Host "宿主源码就绪"
+
+      - name: 安装 .NET 8
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 准备 MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: 还原依赖
+        run: msbuild "${{ steps.locate.outputs.project_file }}" /t:Restore /p:Configuration=Release
+
+      - name: 编译并打包
+        run: msbuild "${{ steps.locate.outputs.project_file }}" /p:Configuration=Release
+
+      - name: 上传插件包
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-pvnplugin
+          path: "**/artifacts/plugin.pvnplugin.zip"
+          if-no-files-found: error

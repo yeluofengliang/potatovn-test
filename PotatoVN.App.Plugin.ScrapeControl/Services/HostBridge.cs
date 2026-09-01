@@ -1,8 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
-using GalgameManager.Enums;
 using GalgameManager.Models;
 using GalgameManager.WinApp.Base.Contracts;
 
@@ -14,10 +14,10 @@ namespace PotatoVN.App.Plugin.ScrapeControl.Services;
 /// 宿主公开给插件的 <see cref="IPotatoVnApi"/> 里并没有"刮削"和"关闭制作人抓取"这两项能力，
 /// 而它们恰恰是刮削耗时的最大来源。本类通过反射拿到宿主内部服务，把这两项能力补上。
 ///
-/// 设计原则：
-/// 1. 反射只做一次并缓存结果，避免每次刮削都去翻类型；
-/// 2. 按"方法签名"找目标，而不是硬编码字段名，宿主小改不易失效；
-/// 3. 任何一步失败都只记录原因、安静降级，绝不把异常抛给宿主。
+/// 关于 GameParseType：
+/// 该枚举定义在宿主主程序（GalgameManager）里，而插件只能引用 GalgameManager.WinApp.Base，
+/// 编译期拿不到这个类型。因此这里一律用「整数位掩码 + 运行时 Enum.ToObject」来回换算，
+/// 完全不依赖编译期类型。
 /// </summary>
 public static class HostBridge
 {
@@ -32,24 +32,20 @@ public static class HostBridge
     private static FieldInfo? _mutatedEventField;
     private static Delegate? _detachedStaffHandler;
 
+    private static Type? _parseTypeEnum;
+    private static readonly Dictionary<string, long> ParseFlags = new(StringComparer.Ordinal);
+
     private static bool _initialized;
     private static string? _error;
 
-    /// <summary>宿主服务是否定位成功。</summary>
     public static bool IsAvailable => _initialized && _galgameService is not null && _parseMethod is not null;
-
-    /// <summary>制作人抓取是否可被本插件控制。</summary>
     public static bool CanControlStaff => _mutatedEventField is not null && _galgameService is not null;
-
-    /// <summary>制作人监听当前是否已摘除。</summary>
     public static bool StaffDetached => _detachedStaffHandler is not null;
-
-    /// <summary>失败原因，用于向用户提示。</summary>
     public static string? ErrorMessage => _error;
 
-    /// <summary>
-    /// 在插件初始化时调用一次，探测宿主能力。
-    /// </summary>
+    /// <summary>是否拿到了 GameParseType 枚举。拿不到就无法按类别刮削。</summary>
+    public static bool HasParseTypeEnum => _parseTypeEnum is not null;
+
     public static void Initialize(IPotatoVnApi hostApi)
     {
         if (_initialized) return;
@@ -65,6 +61,7 @@ public static class HostBridge
 
             LocateStaffService(hostApi);
             PrepareMutatedEventField();
+            LocateParseTypeEnum(hostApi);
         }
         catch (Exception e)
         {
@@ -74,22 +71,17 @@ public static class HostBridge
 
     // ------------------------------------------------------------------ 定位服务
 
-    /// <summary>
-    /// 定位游戏集合服务：优先走宿主自己的服务定位器，失败再扫描 hostApi 的字段。
-    /// </summary>
     private static bool LocateGalgameService(IPotatoVnApi hostApi)
     {
         if (TryLocateViaAppServiceLocator(hostApi)) return true;
         return TryScanHostApiFields(hostApi);
     }
 
-    /// <summary>通过 App.GetService&lt;T&gt;() 拿服务，最直接也最稳。</summary>
     private static bool TryLocateViaAppServiceLocator(IPotatoVnApi hostApi)
     {
         Assembly? assembly = hostApi.GetType().Assembly;
         if (assembly is null) return false;
 
-        // 命名空间来自宿主实现，若将来调整则这里会失配，交由下面的字段扫描兜底
         Type? appType = assembly.GetType("GalgameManager.App")
                         ?? assembly.GetTypes().FirstOrDefault(t => t.Name == "App" && t.IsClass);
         Type? iface = assembly.GetType("GalgameManager.Contracts.Services.IGalgameCollectionService")
@@ -97,15 +89,13 @@ public static class HostBridge
                           t.IsInterface && t.Name == "IGalgameCollectionService");
         if (appType is null || iface is null) return false;
 
-        MethodInfo? getService = appType.GetMethod("GetService",
-            BindingFlags.Public | BindingFlags.Static);
+        MethodInfo? getService = appType.GetMethod("GetService", BindingFlags.Public | BindingFlags.Static);
         if (getService is null) return false;
 
-        object? service = getService.MakeGenericMethod(iface).Invoke(null, null);
+        object? service = SafeGet(() => getService.MakeGenericMethod(iface).Invoke(null, null));
         return service is not null && TryAdoptGalgameService(service);
     }
 
-    /// <summary>兜底：在 hostApi 实例（及其基类）的成员里找带刮削方法的对象。</summary>
     private static bool TryScanHostApiFields(IPotatoVnApi hostApi)
     {
         Type? type = hostApi.GetType();
@@ -116,21 +106,11 @@ public static class HostBridge
                 object? value = SafeGet(() => field.GetValue(field.IsStatic ? null : hostApi));
                 if (value is not null && TryAdoptGalgameService(value)) return true;
             }
-
-            foreach (PropertyInfo property in type.GetProperties(Declared))
-            {
-                object? value = SafeGet(() =>
-                    property.GetValue(property.GetMethod?.IsStatic == true ? null : hostApi));
-                if (value is not null && TryAdoptGalgameService(value)) return true;
-            }
-
             type = type.BaseType;
         }
-
         return false;
     }
 
-    /// <summary>检查对象是否为游戏集合服务（即是否具备刮削方法），是则缓存。</summary>
     private static bool TryAdoptGalgameService(object candidate)
     {
         MethodInfo? parse = FindParseMethod(candidate.GetType());
@@ -142,7 +122,8 @@ public static class HostBridge
     }
 
     /// <summary>
-    /// 按名字与签名查找刮削方法。刻意不要求参数类型完全一致，只要能接收即可。
+    /// 按签名查找刮削方法：ParseGalInfoAsync(Galgame, RssType, bool, GameParseType)。
+    /// 刻意不校验第 1/4 个参数的具体类型——它们位于插件引用不到的主程序里。
     /// </summary>
     private static MethodInfo? FindParseMethod(Type type)
     {
@@ -151,20 +132,17 @@ public static class HostBridge
         {
             if (!string.Equals(method.Name, "ParseGalInfoAsync", StringComparison.Ordinal)) continue;
 
-            ParameterInfo[] parameters = method.GetParameters();
-            if (parameters.Length < 4) continue;
-
-            // (Galgame galgame, RssType rssType, bool requireConfirm, GameParseType type)
-            if (!parameters[0].ParameterType.IsAssignableFrom(typeof(Galgame))) continue;
-            if (parameters[2].ParameterType != typeof(bool)) continue;
+            ParameterInfo[] ps = method.GetParameters();
+            if (ps.Length < 4) continue;
+            if (ps[0].ParameterType.Name != nameof(Galgame)) continue;
+            if (ps[2].ParameterType != typeof(bool)) continue;
+            if (!ps[3].ParameterType.IsEnum) continue;
 
             return method;
         }
-
         return null;
     }
 
-    /// <summary>定位制作人服务，并缓存用于手工补抓的方法。</summary>
     private static void LocateStaffService(IPotatoVnApi hostApi)
     {
         Assembly? assembly = hostApi.GetType().Assembly;
@@ -172,32 +150,27 @@ public static class HostBridge
 
         Type? appType = assembly.GetType("GalgameManager.App")
                         ?? assembly.GetTypes().FirstOrDefault(t => t.Name == "App" && t.IsClass);
-
-        // 注意：制作人服务的接口在 Server 命名空间下，与其他服务不同
+        // 制作人服务的接口在 Server 命名空间下，与其他服务不同
         Type? staffIface = assembly.GetType("GalgameManager.Server.Contracts.IStaffService")
                            ?? assembly.GetTypes().FirstOrDefault(t =>
                                t.IsInterface && t.Name == "IStaffService");
         if (appType is null || staffIface is null) return;
 
-        MethodInfo? getService = appType.GetMethod("GetService",
-            BindingFlags.Public | BindingFlags.Static);
+        MethodInfo? getService = appType.GetMethod("GetService", BindingFlags.Public | BindingFlags.Static);
         if (getService is null) return;
 
         object? service = SafeGet(() => getService.MakeGenericMethod(staffIface).Invoke(null, null));
         if (service is null) return;
 
         _staffService = service;
-
-        // ParseStaffAsync(Galgame) 是公开方法，用于手工补抓
         _parseStaffForGame = service.GetType()
             .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
             .FirstOrDefault(m =>
                 m.Name == "ParseStaffAsync" &&
                 m.GetParameters().Length == 1 &&
-                m.GetParameters()[0].ParameterType.IsAssignableFrom(typeof(Galgame)));
+                m.GetParameters()[0].ParameterType.Name == nameof(Galgame));
     }
 
-    /// <summary>准备 GalgameMutated 事件的后备字段，制作人抓取就挂在这个事件上。</summary>
     private static void PrepareMutatedEventField()
     {
         if (_galgameService is null) return;
@@ -211,25 +184,67 @@ public static class HostBridge
                 _mutatedEventField = field;
                 return;
             }
-
             type = type.BaseType;
+        }
+    }
+
+    /// <summary>
+    /// 从已加载的程序集里找 GameParseType 枚举，并把每个成员的值缓存成整数。
+    /// 只在插件引用不到的主程序里定义，所以必须运行时查找。
+    /// </summary>
+    private static void LocateParseTypeEnum(IPotatoVnApi hostApi)
+    {
+        Assembly[] candidates =
+        [
+            hostApi.GetType().Assembly,
+            _galgameService?.GetType().Assembly ?? typeof(object).Assembly,
+        ];
+
+        foreach (Assembly assembly in candidates)
+        {
+            Type? found = SafeGet(() => assembly.GetType("GalgameManager.Enums.GameParseType"))
+                          as Type
+                          ?? SafeGet(() => assembly.GetTypes().FirstOrDefault(t =>
+                              t.IsEnum && t.Name == "GameParseType")) as Type;
+
+            if (found is null) continue;
+
+            _parseTypeEnum = found;
+            ParseFlags.Clear();
+            foreach (string name in Enum.GetNames(found))
+            {
+                object? value = SafeGet(() => Enum.Parse(found, name));
+                if (value is null) continue;
+                ParseFlags[name] = Convert.ToInt64(value);
+            }
+            return;
+        }
+    }
+
+    /// <summary>取某个刮削类别的位值，取不到返回 0。</summary>
+    public static long Flag(string name) =>
+        ParseFlags.TryGetValue(name, out long value) ? value : 0;
+
+    /// <summary>把位掩码还原成宿主认识的枚举对象。</summary>
+    public static object? MaskToParseType(long mask)
+    {
+        if (_parseTypeEnum is null) return null;
+        try
+        {
+            return Enum.ToObject(_parseTypeEnum, unchecked((int)mask));
+        }
+        catch
+        {
+            return null;
         }
     }
 
     // ------------------------------------------------------------------ 制作人开关
 
-    /// <summary>
-    /// 摘除宿主的"刮完游戏信息就自动抓制作人"的监听。
-    ///
-    /// 宿主在 StaffService 构造时挂上：
-    /// <c>galgameService.GalgameMutated += OnGalgameMutated;</c>
-    /// 只要 ParsedTypes 含 GameInfo 就会触发，且没有任何开关能关掉它。
-    /// 摘除后所有入口的刮削都不会再抓制作人，想抓时用 <see cref="FetchStaffAsync"/> 手动补。
-    /// </summary>
     public static bool DetachStaff()
     {
         if (!CanControlStaff || _galgameService is null || _mutatedEventField is null) return false;
-        if (_detachedStaffHandler is not null) return true;   // 已经摘过了
+        if (_detachedStaffHandler is not null) return true;
 
         try
         {
@@ -239,8 +254,6 @@ public static class HostBridge
             {
                 Type? targetType = handler.Target?.GetType();
                 if (targetType is null) continue;
-
-                // 匹配制作人服务（含其子类/包装类型）
                 if (!targetType.Name.Contains("StaffService", StringComparison.Ordinal)) continue;
 
                 Delegate? reduced = Delegate.Remove(current, handler);
@@ -250,7 +263,6 @@ public static class HostBridge
                 _detachedStaffHandler = handler;
                 return true;
             }
-
             return false;
         }
         catch (Exception e)
@@ -260,11 +272,10 @@ public static class HostBridge
         }
     }
 
-    /// <summary>把之前摘掉的监听挂回去，恢复宿主的默认行为。</summary>
     public static bool AttachStaff()
     {
         if (_galgameService is null || _mutatedEventField is null) return false;
-        if (_detachedStaffHandler is null) return true;      // 本来就没摘
+        if (_detachedStaffHandler is null) return true;
 
         try
         {
@@ -284,7 +295,6 @@ public static class HostBridge
         }
     }
 
-    /// <summary>手工补抓某个游戏的制作人。</summary>
     public static async Task<bool> FetchStaffAsync(Galgame game)
     {
         if (_staffService is null || _parseStaffForGame is null) return false;
@@ -304,24 +314,39 @@ public static class HostBridge
     // ------------------------------------------------------------------ 执行刮削
 
     /// <summary>
-    /// 按指定的信息类别组合刮削单个游戏。
-    /// 与宿主"更新游戏信息"走的是同一个方法，但类别由调用方精确控制。
+    /// 按位掩码刮削单个游戏。
+    /// 参数按「目标方法的实际形参类型」逐个构造，避免枚举类型来自不同程序集导致 Invoke 失败。
     /// </summary>
-    public static async Task<bool> ScrapeAsync(Galgame game, GameParseType parseType)
+    public static async Task<bool> ScrapeAsync(Galgame game, long mask)
     {
         if (!IsAvailable || _parseMethod is null) return false;
 
         try
         {
-            object?[] args = [game, RssType.None, false, parseType];
+            ParameterInfo[] ps = _parseMethod.GetParameters();
+            object?[] args = new object?[ps.Length];
+
+            for (int i = 0; i < ps.Length; i++)
+            {
+                Type t = ps[i].ParameterType;
+
+                if (t.IsInstanceOfType(game)) args[i] = game;
+                else if (t == typeof(bool)) args[i] = false;               // requireConfirm
+                else if (t.IsEnum)
+                {
+                    args[i] = t.Name == "GameParseType"
+                        ? MaskToParseType(mask)
+                        : Enum.ToObject(t, 0);                             // RssType.None
+                }
+                else args[i] = null;
+            }
+
             if (_parseMethod.Invoke(_galgameService, args) is Task task) await task;
             return true;
         }
         catch (Exception e)
         {
-            // 反射调用会把真实异常包在 TargetInvocationException 里，取内层更可读
-            string msg = e.InnerException?.Message ?? e.Message;
-            _error = msg;
+            _error = e.InnerException?.Message ?? e.Message;
             return false;
         }
     }

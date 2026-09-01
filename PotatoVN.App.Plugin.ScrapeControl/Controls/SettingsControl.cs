@@ -42,7 +42,7 @@ public sealed class SettingsControl : UserControl
         RefreshStatus();
     }
 
-    private StdStackPanel BuildRoot()
+private Prefabs.StdStackPanel BuildRoot()
     {
         Prefabs.StdStackPanel root = new();
         root.Children.Add(BuildStatusPanel());

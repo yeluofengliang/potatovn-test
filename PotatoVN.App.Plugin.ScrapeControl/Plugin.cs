@@ -3,9 +3,11 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using GalgameManager.WinApp.Base.Contracts;
+using GalgameManager.WinApp.Base.Contracts.PluginUi;
+using GalgameManager.WinApp.Base.Models;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 using PotatoVN.App.Plugin.ScrapeControl.Controls;
-using PotatoVN.App.Plugin.ScrapeControl.Helper;
 using PotatoVN.App.Plugin.ScrapeControl.Models;
 using PotatoVN.App.Plugin.ScrapeControl.Services;
 
